@@ -1,4 +1,157 @@
 import streamlit as st
+import hashlib
+from datetime import datetime, timezone
+import hmac
+import time
+
+# =============================================================================
+# ===== INÍCIO DO CÓDIGO DE PROTEÇÃO FINAL ====================================
+# =============================================================================
+def init_connection():
+    """Inicializa conexão com Supabase. Requer secrets configurados."""
+    try:
+        from st_supabase_connection import SupabaseConnection
+        return st.connection("supabase", type=SupabaseConnection)
+    except Exception as e:
+        st.error(f"Erro ao conectar com Supabase: {e}")
+        return None
+
+def verify_and_consume_nonce(token: str) -> tuple[bool, str | None]:
+    """Verifica um token de uso único (nonce) no banco de dados e o consome."""
+    conn = init_connection()
+    if not conn:
+        return False, None
+
+    try:
+        # 1. Cria o hash do token recebido para procurar no banco
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        
+        # 2. Procura pelo token no banco de dados
+        response = conn.table("auth_tokens").select("*").eq("token_hash", token_hash).execute()
+        
+        if not response.data:
+            st.error("Token de acesso inválido ou não encontrado.")
+            return False, None
+        
+        token_data = response.data[0]
+        
+        # 3. Verifica se o token já foi utilizado
+        if token_data["is_used"]:
+            st.error("Este link de acesso já foi utilizado e não é mais válido.")
+            return False, None
+            
+        # 4. Verifica se o token expirou
+        expires_at = datetime.fromisoformat(token_data["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            st.error("O link de acesso expirou. Por favor, gere um novo no portal.")
+            return False, None
+            
+        # 5. Se tudo estiver correto, marca o token como usado (consumido)
+        conn.table("auth_tokens").update({"is_used": True}).eq("id", token_data["id"]).execute()
+        
+        user_email = token_data["user_email"]
+        return True, user_email
+        
+    except Exception as e:
+        st.error(f"Ocorreu um erro crítico durante a validação do acesso: {e}")
+        return False, None
+
+def verify_auth_token(token: str, secret_key: str) -> tuple:
+    """Verifica um token de autenticação HMAC-SHA256 com timestamp."""
+    try:
+        parts = token.split(':')
+        if len(parts) != 3:
+            return False, None
+        
+        email, timestamp, signature = parts
+        
+        # 1. Verifica se o token expirou (validade de 1 hora)
+        if int(time.time()) - int(timestamp) > 3600:
+            st.error("Token de autenticação expirado.")
+            return False, None
+        
+        # 2. Recria a assinatura esperada para verificação
+        message = f"{email}:{timestamp}"
+        expected_signature = hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
+        
+        # 3. Compara as assinaturas de forma segura
+        if hmac.compare_digest(signature, expected_signature):
+            return True, email
+        else:
+            st.error("Token de autenticação inválido.")
+            return False, None
+            
+    except Exception as e:
+        st.error(f"Erro ao verificar token: {e}")
+        return False, None
+
+def check_authentication():
+    """Verifica autenticação usando sistema duplo: Supabase + HMAC fallback"""
+    # --- Lógica Principal de Autenticação ---
+    query_params = st.query_params
+    access_token = query_params.get("access_token")
+    auth_token = query_params.get("auth_token")
+
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+
+    # Primeiro tenta Supabase (access_token)
+    if access_token and not st.session_state.authenticated:
+        time.sleep(1)  # PAUSA ESTRATÉGICA PARA EVITAR RACE CONDITION
+        is_valid, email = verify_and_consume_nonce(access_token)
+        if is_valid:
+            st.session_state.authenticated = True
+            st.session_state.user_email = email
+            return True
+
+    # Fallback para HMAC (auth_token)
+    if auth_token and not st.session_state.authenticated:
+        try:
+            auth_secrets = st.secrets.get("auth", {})
+            secret_key = auth_secrets.get("token_secret_key")
+
+            if secret_key:
+                is_valid, email = verify_auth_token(auth_token, secret_key)
+                if is_valid:
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = email
+                    return True
+            else:
+                st.error("Chave secreta de autenticação não configurada no aplicativo.")
+                
+        except Exception as e:
+            st.error(f"Ocorreu um erro durante a autenticação: {e}")
+
+    return st.session_state.get('authenticated', False)
+
+def show_access_denied():
+    """Mostra página de acesso negado"""
+    st.title("🔒 Acesso Restrito")
+    st.error("Este aplicativo requer autenticação. Por favor, faça o login através do portal.")
+    
+    st.link_button(
+        "Ir para o Portal de Login",
+        "https://huggingface.co/spaces/MarioNunes34/Portal",
+        use_container_width=True,
+        type="primary"
+    )
+    st.stop()
+
+# =============================================================================
+# ===== FIM DO CÓDIGO DE PROTEÇÃO =============================================
+# =============================================================================
+
+# Verificação de autenticação
+if not check_authentication():
+    show_access_denied()
+
+# Mensagem de boas-vindas para o usuário autenticado
+st.success(f"Autenticação bem-sucedida! Bem-vindo, {st.session_state.get('user_email', 'usuário')}.")
+
+# =============================================================================
+# ===== INÍCIO DO APLICATIVO PRINCIPAL ======================================
+# =============================================================================
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -327,7 +480,7 @@ if uploaded_file is not None:
                 st.error("Dados insuficientes para ajuste (mínimo 3 pontos)")
             else:
                 # Mostrar informações dos dados carregados para debug
-                st.info(f"🔍 **Dados carregados:** {len(t_data)} pontos | Tempo: {t_data.min():.2f} - {t_data.max():.2f} | qt: {qt_data.min():.2f} - {qt_data.max():.2f}")
+                st.info(f"📊 **Dados carregados:** {len(t_data)} pontos | Tempo: {t_data.min():.2f} - {t_data.max():.2f} | qt: {qt_data.min():.2f} - {qt_data.max():.2f}")
                 
                 # Ajustar modelos
                 peso_text = "com pesos baseados no desvio padrão" if sigma_col != 'Nenhuma (sem peso)' else "com pesos uniformes"
@@ -726,13 +879,13 @@ if 'results' in st.session_state:
         st.info("""
         **📋 Estrutura do arquivo Excel:**
         
-        🔸 **Dados_Experimentais:** Seus dados originais + predições nos pontos experimentais + resíduos
+        📸 **Dados_Experimentais:** Seus dados originais + predições nos pontos experimentais + resíduos
         
-        🔸 **Curvas_Ajustadas:** Curvas suaves para criar gráficos elegantes (tempo_curva + curvas de cada modelo)
+        📸 **Curvas_Ajustadas:** Curvas suaves para criar gráficos elegantes (tempo_curva + curvas de cada modelo)
         
-        🔸 **Parametros_e_Incertezas:** Parâmetros ajustados com incertezas, R², χ² e equações
+        📸 **Parametros_e_Incertezas:** Parâmetros ajustados com incertezas, R², χ² e equações
         
-        🔸 **Resumo_Ajuste:** Informações gerais sobre o tipo de ajuste e configurações
+        📸 **Resumo_Ajuste:** Informações gerais sobre o tipo de ajuste e configurações
         """)
 
 else:
@@ -791,5 +944,5 @@ else:
     
     ⚙️ **Controle de resolução:** Configure quantos pontos usar nas curvas (100-1000 pontos, padrão: 300)
     
-    🔍 **Estrutura organizada:** Cada tipo de informação em abas separadas para facilitar o uso
+    📁 **Estrutura organizada:** Cada tipo de informação em abas separadas para facilitar o uso
     """)
